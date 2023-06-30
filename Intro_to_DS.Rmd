@@ -1,0 +1,632 @@
+---
+title: "R Notebook Coursework"
+output:
+  html_document:
+    df_print: paged
+    number_sections: true
+    toc: true
+    toc_depth: 5
+---
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library("here")
+library("tidyverse")
+library("lubridate")
+library("ggrepel")
+library("gapminder")
+library("readr")
+library("janitor")
+library("stringr")
+```
+
+```{r}
+# importing data
+trips <- read_csv(here("data", "rides_2019_2020_extract.csv"))
+stations <- read_csv(here("data", "bikeshare_locations.csv"))
+
+# cleaning names
+trips <- clean_names(trips)  
+stations <- clean_names(stations)
+
+# removing unwanted columns 
+trips <- trips %>%
+  select(-c(ride_id, is_equity))
+
+stations <- stations %>%
+  select(-c(installed, install_date, removal_date, se_anno_cad_data, owner, 
+            temporary_install))
+
+# correcting duration 
+trips <- trips %>%
+  mutate(duration = end_date - start_date) 
+
+# remove any negative duration 
+trips <- trips %>%
+  filter(duration > 0)
+
+
+# correcting member types
+trips <- trips %>%
+  mutate(member_casual = str_replace_all(member_casual, pattern = "casual", 
+                                         replacement = "Casual")) %>%
+  mutate(member_casual = str_replace_all(member_casual, pattern = "member", 
+                                         replacement = "Member")) 
+
+# correcting NAs in latitude, longitude, start_names, end_names
+# fill in missing lat, lng
+trips <- trips %>%
+  left_join(stations, by = c("start_station_name" = "address")) %>%
+  rename(start_longitude = longitude, start_latitude = latitude) %>%
+  left_join(stations, by = c("end_station_name" = "address")) %>%
+  rename(end_longitude = longitude, end_latitude = latitude) %>%
+  select(colnames(trips) | contains("longitude") | contains("latitude"))
+
+# fill in missing start and end station names 
+trips <- trips %>%
+  left_join(
+    stations,
+    by = c("start_longitude" = "longitude", "start_latitude" = "latitude")) %>%
+  rename(start_address = address) %>%
+  left_join(
+    stations, 
+    by = c("end_longitude" = "longitude", "end_latitude" = "latitude")) %>%
+  rename(end_address = address) %>%
+  select(colnames(trips) | contains("start_address") | contains("end_address"))
+
+
+# reduce the names columns by merging together the imported and original ones
+trips <- trips %>%
+  mutate(start_station_name = coalesce(start_station_name, start_address)) %>%
+  mutate(end_station_name = coalesce(end_station_name, end_address)) %>%
+  select(-c(start_address, end_address))
+
+# reduce the geo points colums by mergin together the imported and original ones 
+trips <- trips %>%
+  mutate(start_lat = coalesce(start_lat, start_latitude)) %>%
+  mutate(start_lng = coalesce(start_lng, start_longitude)) %>%
+  mutate(end_lat = coalesce(end_lat, end_latitude)) %>%
+  mutate(end_lng = coalesce(end_lng, end_longitude)) %>%
+  select(-c(start_longitude, end_longitude, start_latitude, end_latitude))
+
+# use the longitude and latitude coordinates to turn them into distance between 
+# start/end points - via the Haversine formula
+trips <- trips %>%
+  mutate(earth_radius = 6371) %>%
+  mutate(start_lat_rad = start_lat * pi/180) %>%
+  mutate(end_lat_rad = end_lat * pi/180) %>%
+  mutate(change_lat = (end_lat - start_lat) * pi/180) %>%
+  mutate(change_lng = (end_lng - start_lng) * pi/180) %>%
+  mutate(a = (sin(change_lat / 2)^2 + cos(start_lat_rad) * cos(end_lat_rad) * 
+                sin(change_lng / 2)^2)) %>%
+  mutate(c = 2 * asin(sqrt(a))) %>%
+  mutate(distance_km = c * earth_radius) %>%
+  select(colnames(trips) | contains("distance_km"))
+```
+
+
+# **Introduction**
+## Motivation for the work below 
+  The main aim of this coursework is to provide insights into bike sharing 
+  patterns and features from the raw data that has been made available by 
+  Capital Bikeshare. 
+  With the idea that results gotten at the end of this 
+  coursework, can answer interesting questions related to the features of the 
+  sample that we have available to us. But also those outcomes can lead 
+  to new questions, which require either more detailed data or more 
+  sophisticated methods. 
+  
+  The topic of bike sharing is worth examining, as shared public transport, such 
+  as e-cotters and bikes have been becoming more and more popular in recent 
+  years. And this trend is likely to continue to do so, as gas prices remain 
+  relatively high, tighter emission standards for vehicles are getting passed, 
+  and congestion remains a prominent issue, making conventional transport
+  uneconomical to use for personal transportation.
+  
+# **Data**
+## Raw Data
+  The data used for this report comes from Capital Bikeshare's trips history 
+  data which is publicly available on their website 
+  https://ride.capitalbikeshare.com/system-data. The raw data includes two 
+  datasets. `trips` gives us information about all the rides that have started 
+  between the periods of 1st of January 2019 and 31st of December 2020. And 
+  `stations` inform us about all the available bike stations across Capital 
+  Bikeshare's network.
+  
+  The raw data files include 16 and 17 variables each. Some of those various
+  variables will be utilized, but some won't and therefore will be removed. As 
+  they are either not recorded properly or do not give us insightful information. 
+  
+## Main retained Variables 
+  Here is a brief summary of the main retained variables from both datasets:
+
+  + `duration` - duration of a single trip
+  + `start_date` and `end_date` -  when has a trip started and ended 
+  + `start_station_name` and `end_station_name` - from which bike station a trip
+  starts and at which station the trip ends
+  + `address` - a street location of a bike station
+  + `start_station_id` and `end_station_id` - same as the above, but instead of 
+  names, using the unique numbers of each bike station
+  + `objectid` - an unique number of an individual bike station
+  + `bike_number` - an unique number of the bike being used
+  + `member_casual` - a type of user, indicating whether they have purchased a 
+  casual "pass" ride plan, or have become a member by getting a "membership" ride 
+  plan
+  + `rideable_type` - type of bicycle being used 
+  + `start_lat`, `start_lng`, `end_lat`, `end_lng` - the starting and ending 
+  coordinates of a single trip
+  + `latitude`, `longitude` - the coordinates of an individual bike station
+
+
+## Excluded variables 
+  Here is a summary of all the variables that were eliminated from both datasets:
+  
+  + `ride_id` - unique number of a ride, which was not utilized at any of the 
+  steps carried in the report later on, thus removed 
+  + `is_equity` - not made clear what it stands for and was not utilized
+  at any of the steps carried in the report later on, thus removed 
+  + `installed` - whether a station has been installed, but as all were of the 
+  status installed, the variable was obsolete and thus removed 
+  + `install_date` and `removal_date` - presumably the installation and removal
+  dates of single stations, but as for all stations those both variables indicate
+  1st January 1970, the variables were obsolete and thus removed 
+  + `se_anno_cad_data` - not made clear for what it stand, but as it was filled 
+  with only NA's, it was not utilized at any of the steps carried in the report
+  later on, thus removed 
+  + `owner` - indicates who owns the stations, but it was not utilized at any of
+  the steps carried in the report later, thus removed 
+  + `temporary_install` - as none of the stations was a temporary install, this 
+  variable was obsolete and thus removed 
+
+## Creation of new variables
+  A few additional variables were either modified or added, here is a summary of
+  those:
+  
+  + `duration` - was modified by calculating the difference between
+  `start_date` and `end_date`, as it previously it was filled with many missing 
+  values
+  + `member_casual` - was modified by standardizing the format for *Members* and 
+  *Casual* users
+  + `start_lat`, `start_lng`, `end_lat`, `end_lng` - were modified, by in filling 
+  their missing values, via the dataset `stations`
+  + `distance_km` - a new variable, that is based on the Haversine formula,
+  calculating the distance in kilometers between the start and end points of a 
+  journey, based on `start_lat`, `start_lng`, `end_lat`, `end_lng`
+
+
+# **Questions**
+## Question 1 
+  **How has the demand for shared bike riding provided by Capital Bikeshare changed
+  between 2019 and 2020 on a monthly basis?**
+  
+  + Operationalization: The demand for shared bike riding will be measured by the 
+  total number of rides that have occurred during a particular period of time. In 
+  the case of *Question 1*, the time period will be each month of either 2019 
+  or 2020. 
+  
+## Question 2
+  **During the day, are *Casual* users using the services provided by Capital Bikeshare to a greater extent than *Member* users?**
+  
+  + Operationalization: The utilization variable will be measured by the hours 
+  spent on journeys. As this is the only measurement that we have to base the 
+  actual use of the service. Further, the journey times will be ordered, 
+  depending on which part of the day they have started. As well as by what type 
+  of user they have been carried out.
+
+## Question 3
+  **People that opt for an electric bike, can either leave it at a bike station free of charge or leave it at any public bike rack for an additional 2$ charge.**
+  **Is this choice related to the distance between a journey's start and end points or the duration of it? And has this behavior been consistent over time?**
+  
+  + Operationalization: To differentiate between which users have been 
+  charged an additional 2$, we will look at which journeys made via an electric 
+  bike that have no end station, but rather just end coordinates. Based on these 
+  findings, we will examine, if this decision has a relation with the 
+  duration of the ride in minutes and the distance in kilometers between the 
+  start and end points of the journey. It is important to note that we don't 
+  imply any causality. 
+  
+## Question 4
+  **Is the distance traveled between the start and end bike stations, indicative of the riding plan chosen by a user?**
+
+  + Operationalization: The distance between the start and end bike stations will
+  be measured in kilometers. And further, those distances will be grouped depending 
+  on the ride plan that users have opted to choose. Measuring the density that 
+  each user group represents, based on their distances.
+  
+## Question 5 
+  **Which are the 5 most popular journeys among Capital Bikashare's users and how long does it take them on average to complete it?**
+  
+  + Operationalization:  The journey variable will be consisting of a combination
+  between the start and end station of a bike ride. The 5 most popular journeys
+  are going to be chosen based on their frequency. While the average times of 
+  completion are going to be measured in hours by a median. With further 
+  information about the spread, provided by an interquartile range.
+
+# **Analysis**
+## Analysis to Question 1 
+
+```{r}
+# Question 1 
+# setting the graph 
+tripsQ1 <- trips %>%
+  mutate(start_year = format(trips$start_date, format = "%Y")) %>%
+  mutate(start_month = format(trips$start_date, format = "%b")) %>%
+  mutate(start_month = factor(start_month, levels = month.abb))
+
+q1_plot <- ggplot(
+    data = tripsQ1,
+    mapping = aes(x = start_month))
+
+q1_graph_backdrop <- geom_bar(
+    data = transform(tripsQ1, start_year = NULL),
+    fill = "grey85")
+
+q1_scaling <- scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.05)))
+
+q1_labels <- labs(
+    title = "Demand for Capital Bikeshare's service throughout 2019 and 2020",
+    x = "Month",
+    y = "Amount of rides taken")
+
+q1_theme_settings <- theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    panel.grid.minor.y = element_line(colour = "grey80"),
+    strip.text.x = element_text(size = 13))
+
+# building the graph 
+  q1_plot + 
+  q1_graph_backdrop +
+  geom_bar () +
+  facet_wrap(facets = vars(start_year)) +
+  q1_scaling +
+  q1_labels +
+  q1_theme_settings
+```
+
+ What can be immediately seen from the "Demand for Capital Bikeshare's service 
+ throughout 2019 and 2020" figure is that 2020 has seen far fewer rides taken, 
+ relative to 2019. 
+ It is interesting to notice that there is a sharp drop in April 2020, after 
+ which the demand for the service is not able to catch up to the 2019 figures. 
+ This perhaps may be due to COVID-19 measures that have been taking place at 
+ that time.
+ 
+ Further, it can be noticed, that the months of November, December, January, and 
+ February see far fewer rides being taken, relative to the rest. This pattern
+ holds true for both years in mind. The decline may be due to less favorable
+ weather that there might be for riding a bike.
+ 
+## Analysis to Question 2 
+
+```{r}
+# Question 2 
+# setting the graph 
+tripsQ2 <- trips %>%
+  mutate(duration = as.double(duration / 3600)) %>%
+  mutate(start_hour = format(trips$start_date, format = "%H"))
+
+q2_plot <- ggplot(
+    data = tripsQ2,
+    mapping = aes(x = start_hour, y = duration, colour = member_casual, 
+                  fill = member_casual))
+
+q2_scaling <- scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.14)),
+    n.breaks = 7) 
+  
+q2_colour_scaling <- scale_colour_manual(values = c("#990000", "#1380A1"))
+
+q2_theme_settings <- theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    panel.grid.minor.y = element_line(colour = "grey80"))
+    # axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) 
+
+q2_labels <- labs(
+    title = "Usage of Capital Bikeshare's service",
+    x = "Time of day",
+    y = "Total usage hours",
+    fill = "User type",
+    colour = "User type") 
+
+# building the graph
+q2_plot +
+  geom_col() +
+  q2_scaling +
+  q2_colour_scaling +
+  q2_labels +
+  q2_theme_settings
+```
+
+The graph "Usage of Capital Bikeshare's service" shows that in every hour of the 
+day, *Casual* users tend to spend more time on the bike sharing platform, 
+relative to  *Members* users.
+Further, it is interesting to notice that in the morning between 7 AM and 8 AM 
+there is a sudden surge, in the duration of journeys being made, regardless of the
+type of user. However, it is not until in the afternoon after 3 PM that the most
+time is accumulated of using the service. Those times tend to be dominated by 
+*Casual* members.
+
+For both user types, the most popular time for starting a journey is 5 PM, 
+whilst the least popular is 4 AM.
+
+## Analysis to Question 3 
+
+```{r}
+# Q3
+# setting up the graph
+trips_Q3 <- trips %>%
+  mutate(start_date1 = as.Date(start_date)) %>%
+  filter(rideable_type == "electric_bike") %>% 
+  filter(distance_km < 47) %>%
+  mutate(duration = as.double(duration / 60)) %>%
+  mutate(end_station_returned = as.logical(is.na(end_station_name))) %>%
+  mutate(end_station_returned = case_when(
+    end_station_returned == TRUE ~ "Yes", #not returned to a station
+    end_station_returned == FALSE ~ "No")) #returned to a station
+
+q3_plot <- ggplot(
+    data = trips_Q3,
+    mapping = aes(x = start_date1, y = distance_km, colour = end_station_returned, size = duration))
+
+q3_colour_scaling <- scale_colour_manual(values = c("#1380A1", "#990000"))
+
+q3_x_scaling <- scale_x_date(
+    limits = as_date(c("2020-06-17", "2020-31-12")),
+    date_breaks = "1 month",
+    date_labels = "%b")
+
+q3_y_scaling <- scale_y_continuous(
+    expand = expansion(mult = c(0.02, 0.3)),
+    n.breaks = 6)
+
+q3_labels <- labs(
+    title = "Additional charge for e-bikes relation to duration and distance",
+    x = "Month (2020)",
+    y = "Distance (km)",
+    colour = "Additionally charged",
+    size = "Duration of journey (minutes)")
+
+q3_theme_formatting <- theme_minimal() +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey80"),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    panel.grid.minor.y = element_line(colour = "grey80")) 
+
+# building the graph
+q3_plot +
+  geom_point(alpha = 0.4) +
+  q3_colour_scaling +
+  q3_x_scaling +
+  q3_y_scaling +
+  coord_cartesian(ylim = c(0, 20)) +
+  q3_labels +
+  q3_theme_formatting
+```
+
+Something interesting about the "Additional charge for e-bikes relation to duration 
+and distance" figure is that the *Month (2020)* scale starts from mid-June. 
+This is the case as e-bikes have been introduced on the 17th of June 2020 and 
+simply previous data does not exist. 
+
+The figure makes it immediately clear that the majority of users that use e-bikes 
+are opting not to get charged an additional 2$ and return their e-bike to an end 
+station. However it can be seen that between September and November, there
+has been some increase in the users that have preferred to pay the additional 
+charge. Further, interestingly those members have traveled for at least 
+more 1 kilometer between their initial and final point.
+
+Moving up the y-axis, it can be seen that for users that have traveled around or 
+more than 10km there is an increase in the choices to pay the additional charge. 
+Further, it can be noticed that people that have preferred to lock their e-bikes
+to a public stand have a much higher journey duration, than those who have returned 
+theirs at a Capital Bikeshare station.
+
+## Analysis to Question 4 
+
+```{r}
+# Q4
+# setting the graph
+trips_Q4 <- trips %>%
+  mutate(duration = as.double(duration / 60)) %>%
+  filter(duration < 120) %>%
+  filter(distance_km < 47)
+
+q4_plot <- ggplot(
+    data = trips_Q4,
+    mapping = aes(x = distance_km, colour = member_casual, fill = member_casual)
+  )
+
+q4_colour_scaling <- scale_colour_manual(values = c("#990000", "#1380A1"))
+  
+q4_x_scaling <- scale_x_continuous(breaks = seq(0, 20, 5))
+
+q4_y_scaling <- scale_y_continuous(
+    expand = expansion(mult = c(0.02, 0.1)))
+  
+q4_text_annotation <- annotate(
+    geom = "text",
+    x = 15,
+    y = 0.5,
+    label = "start and end points \nof those journeys \nare identical", 
+    size = 4.2,
+    stroke = 1.1)
+  
+q4_top_curve <- annotate(
+    geom = "curve",
+    x = 11.2,
+    y = 0.50,
+    xend = 0.15,
+    yend = 0.6,
+    curvature = -0.1,
+    arrow = arrow(length = unit(2.5, "mm")),
+    alpha = 0.8)
+  
+q4_bottom_curve <- annotate(
+    geom = "curve",
+    x = 11.6,
+    y = 0.48,
+    xend = 0.15,
+    yend = 0.2,
+    curvature = 0.15,
+    arrow = arrow(length = unit(2.5, "mm")),
+    alpha = 0.8)
+   
+q4_labels <- labs(
+    title = "Distance traveled between start and end stations relation to ride plan",
+    x = "Distance (km)",
+    y = "Density",
+    fill = "User type",
+    colour = "User type")
+  
+q4_theme_formatting <- theme_minimal() +
+  theme(
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    panel.grid.minor.y = element_line(colour = "grey80")) 
+
+# building the graph
+q4_plot +
+  geom_density(
+    size = 0.9, 
+    alpha = 0.3) +
+  q4_colour_scaling +
+  q4_x_scaling +
+  q4_y_scaling +
+  q4_text_annotation +
+  q4_top_curve +
+  q4_bottom_curve +
+  q4_labels +
+  q4_theme_formatting
+```
+
+The "Distance traveled between start and end stations relation to ride plan", 
+shows us that for both user types a popular choice is to return their rented 
+bike to the same station from which they have taken it initially. 
+This is indicated by the both the red and blue line surges along the y axis at 
+the 0 km mark.
+
+Another interesting trend is there is a greater chance a user from *Members* to 
+prefer returning their bike to a different station than their initial one, 
+relative to a *Casual* user. As seen by the area difference of the blue and red
+peaks between the 0 and 2 kilometers mark roughly.
+
+And finally this graph shows is that the very little chance of the population 
+of users regardless of the type that are willing to make a journey between 
+stations that are more than 5 km apart.
+
+## Analysis to Question 5 
+
+```{r}
+# Q5 
+# setting the graph
+popularity <- trips %>%
+  drop_na(start_station_name) %>%
+  drop_na(end_station_name) %>%
+  unite(
+    col = "journey",
+    c(start_station_name, end_station_name),
+    sep = " to "
+  ) %>%
+  group_by(journey) %>%
+  summarise(
+    journey_pop = n()
+  ) %>%
+  top_n(5) %>%
+  arrange(desc(journey_pop))
+
+journeys <- trips %>%
+  mutate(duration = as.double(duration)) %>%
+  drop_na(start_station_name) %>%
+  drop_na(end_station_name) %>%
+  unite(
+    col = "journey",
+    c(start_station_name, end_station_name),
+    sep = " to "
+  )
+
+trips_Q5 <- popularity %>%
+  left_join(
+    journeys,
+    by = "journey"
+    ) %>%
+  mutate(duration = as.double(duration / 3600)) %>%
+  mutate(year = year(start_date)) 
+
+  q5_plot <- ggplot(
+    data = trips_Q5,
+    mapping = aes(x = duration, y = journey, fill = journey_pop))
+
+  q5_x_scalling <- coord_cartesian(xlim = c(0, 4))
+  
+  q5_y_scalling <- scale_y_discrete(labels = function(y) str_wrap(y, width = 27))
+  
+  q5_labels <- labs(
+    title = "Rent times for the 5 most popular routes",
+    x = "Duration (hours)",
+    y = "",
+    fill = "Times journey being taken")
+  
+  q5_theme_formatting <- theme_minimal() +   
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey80"),
+    panel.grid.minor.x = element_line(colour = "grey80"),
+    legend.position = "top")
+  
+  # building the graph 
+  q5_plot +
+    geom_boxplot() +
+    scale_fill_viridis_b() +
+    q5_x_scalling +
+    q5_y_scalling +
+    q5_labels +
+    q5_theme_formatting
+```
+
+From the figure "Rent times for the 5 most popular routes" it can
+be seen that all of the 5 most popular journeys, commence and finish at the same 
+bike station. Given the results from Question 4, this does not seem surprising.
+ 
+Further, it can be seen that half of the users carrying out those journeys, 
+rent out a bike from anywhere 30 minutes to an hour and fifteen minutes. The 
+only exception is the fifth most popular journey, which starts and finishes at 
+Gravelly Point. Fifty percent of the population done it, tend to 
+complete it for anywhere between 20 to 50 minutes.
+
+
+# **Conclusion** 
+## Summary of results 
+  The results that we have obtained have given us useful insights concerning
+  bike sharing. 
+  
+  First of all, we found that the overall demand for the Capital Bikeshare in Washington 
+  DC has fallen in 2020, in comparison to 2019. Further, we saw that the majority
+  of users in terms of time spent using the service are of the *Casual* type.
+  With the third question, we saw that a large proportion of e-bike users,
+  prefer not to pay 2$ for the convenience of leaving their bike pretty much 
+  anywhere. And we examined that there is a relationship between electric 
+  bicycle users that tend to opt for the additional charge and substantial distance 
+  over a great duration period. With our last two questions, we were able to find 
+  out that the majority of journeys, tend to start and end at the same station. 
+  For the 5 most popular such trips, users on average rent a bike for 
+  just under an hour.
+  
+## Further questions
+  Given the analysis done above, it will be interesting to see how the 
+  duration of the rides has differed with actual traveled distance and 
+  not only distance between the initial and finishing bike stations. As this will 
+  give us more insight into the potential wear and tear of the bikes. But also 
+  could be used for predicting average times for various common travel routes.
+
